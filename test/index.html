@@ -1,0 +1,34 @@
+<!doctype html>
+
+<html lang="en">
+
+<head>
+	<meta charset="utf-8">
+	<title>WSStream test</title>
+</head>
+
+<body>
+	<script type=module>
+    import init from '/wasm_websocket.js';
+	init().catch(console.error);
+// 	const socket = new WebSocket("ws://localhost:8080");
+// 	socket.onerror = console.error;
+
+// 	console.log("connecting the socket...")
+// // Lorsque la connexion est établie.
+// 	socket.onopen = function(event) {
+//     	console.log("Connexion établie.");
+
+//     	// Lorsque la connexion se termine.
+//     	this.onclose = () => console.log("Connexion terminé.")
+
+//     	// Lorsque le serveur envoi un message.
+//     	this.onmessage = e => console.log("Message:", e.data);
+
+//     	// Envoi d'un message vers le serveur.
+//     	this.send("Hello world!");
+// 	};
+  </script>
+</body>
+
+</html>
