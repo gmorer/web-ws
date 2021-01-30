@@ -1,5 +1,5 @@
 [package]
-name = "wasm_websocket"
+name = "web_ws"
 version = "0.1.0"
 authors = ["tet <gmorer@pm.me>"]
 edition = "2018"
