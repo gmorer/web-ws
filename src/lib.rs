@@ -1,17 +1,18 @@
-use std::cell::RefCell;
-use std::rc::Rc;
-use std::pin::Pin;
+#![no_std]
+use core::cell::RefCell;
+use core::pin::Pin;
 use bytes::{ Bytes, BytesMut };
-use futures::channel::mpsc::{ unbounded, UnboundedReceiver, UnboundedSender };
 use futures::channel::oneshot;
 use futures::task::{ Poll, Context, Waker }; 
 use futures::future::{self, Either};
-use futures::SinkExt;
-use futures::stream::StreamExt;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
-use wasm_bindgen_futures::spawn_local;
 use web_sys::{ErrorEvent, MessageEvent, WebSocket};
+
+extern crate alloc;
+use alloc::rc::Rc;
+use alloc::string::{ ToString, String };
+use alloc::prelude::v1::Box;
 
 #[wasm_bindgen]
 extern "C" {
@@ -37,22 +38,6 @@ pub enum Error {
 	Js(ErrorEvent)
 }
 
-async fn bg_thread(buffer: Rc<RefCell<BytesMut>>, waker: Rc<RefCell<Option<Waker>>>, state: Rc<RefCell<State>>, internal_receiver: UnboundedReceiver<Bytes>, close_receiver: oneshot::Receiver<bool>) {
-	/* Look if we can put this logic only in the callbacks and not create a local thread */
-	let receiver = internal_receiver.map(|data| {
-		waker.borrow().as_ref().map(|waker| waker.wake_by_ref());
-		buffer.borrow_mut().extend_from_slice(&data);
-	}).collect::<()>();
-	match future::select(receiver, close_receiver).await {
-		Either::Left((_, _)) => {
-			*state.borrow_mut() = State::Closed;
-		},
-		Either::Right((_, _)) => {
-			*state.borrow_mut() = State::Closed;
-		}
-	};
-	waker.borrow().as_ref().map(|waker| waker.wake_by_ref());
-}
 
 #[derive(Debug)]
 pub struct WSStream {
@@ -77,24 +62,36 @@ impl WSStream {
     pub async fn connect(url: &str) -> Result<WSStream, Error> {
         let ws = WebSocket::new(url).map_err(|_| Error::Any)?;
         ws.set_binary_type(web_sys::BinaryType::Arraybuffer);
-        let (internal_sender, internal_receiver): (UnboundedSender<Bytes>, UnboundedReceiver<Bytes>) = unbounded::<Bytes>();
 
-        // On Message
+		// Value shared with the callbacks and the struct
+		let state = Rc::new(RefCell::new(State::Connected));
+		let buffer = Rc::new(RefCell::new(BytesMut::new()));
+		let waker: Rc<RefCell<Option<Waker>>> = Rc::new(RefCell::new(None));
+
+		// On Message
+		let buffer_cl = buffer.clone();
+		let waker_cl = waker.clone();
         let on_message_cb = Closure::wrap(Box::new(move |e: MessageEvent| {
-			if let Ok(abuf) = e.data().dyn_into::<js_sys::ArrayBuffer>() {
+			let data = if let Ok(abuf) = e.data().dyn_into::<js_sys::ArrayBuffer>() {
 				let array = js_sys::Uint8Array::new(&abuf);
-				internal_sender.unbounded_send(Bytes::from(array.to_vec())).ok();
+				Bytes::from(array.to_vec())
 			} else if let Ok(txt) = e.data().dyn_into::<js_sys::JsString>() {
-				internal_sender.unbounded_send(Bytes::from(String::from(&txt))).ok();
-			}
+				Bytes::from(String::from(&txt))
+			} else {
+				console_log!("Unknow incomming data");
+				return ;
+			};
+			buffer_cl.borrow_mut().extend_from_slice(&data);
+			waker_cl.borrow().as_ref().map(|waker| waker.wake_by_ref());
         }) as Box<dyn FnMut(MessageEvent)>);
         ws.set_onmessage(Some(on_message_cb.as_ref().unchecked_ref()));
 
         // On close
-		let (send_close, close_receiver) = oneshot::channel();
-		let mut send_close = Some(send_close);
+		let state_cl = state.clone();
+		let waker_cl = waker.clone();
         let on_close_cb = Closure::wrap(Box::new(move |_| {
-			send_close.take().map(|sender| sender.send(true).ok());
+			*state_cl.borrow_mut() = State::Closed;
+			waker_cl.borrow().as_ref().map(|waker| waker.wake_by_ref());
         }) as Box<dyn FnMut(JsValue)>);
         ws.set_onclose(Some(on_close_cb.as_ref().unchecked_ref()));
 
@@ -122,26 +119,19 @@ impl WSStream {
 		}
         ws.set_onopen(None);
 
-		let state = Rc::new(RefCell::new(State::Connected));
-		let state_cl = state.clone();
         // On error
+		let state_cl = state.clone();
         let on_error_cb = Closure::wrap(Box::new(move |e: ErrorEvent| {
 			*state_cl.borrow_mut() = State::Errored(e); 
         }) as Box<dyn FnMut(ErrorEvent)>);
 		ws.set_onerror(Some(on_error_cb.as_ref().unchecked_ref()));
-
-		let buffer = Rc::new(RefCell::new(BytesMut::new()));
-		let read_waker = Rc::new(RefCell::new(None));
-
-		/* Spawn local thread */
-		spawn_local(bg_thread(buffer.clone(), read_waker.clone(), state.clone(), internal_receiver, close_receiver));
 
         Ok(WSStream {
 			ws,
             on_error_cb,
             on_message_cb,
 			on_close_cb,
-			read_waker,
+			read_waker: waker,
 			buffer,
 			state
         })
@@ -203,7 +193,7 @@ impl futures::stream::Stream for WSStream {
 			self.read_waker.replace(Some(cx.waker().clone()));
 			Poll::Pending
 		} else {
-			let ret = std::mem::replace(&mut *internal_buf, BytesMut::new());
+			let ret = core::mem::replace(&mut *internal_buf, BytesMut::new());
 			Poll::Ready(Some(ret.freeze()))			
 		}
 	}
@@ -211,6 +201,8 @@ impl futures::stream::Stream for WSStream {
 
 // TODO: headless browser tests
 /*
+use futures::StreamExt;
+use futures::SinkExt;
 #[wasm_bindgen(start)]
 pub async fn start() -> Result<(), JsValue> {
 	console_log!("It started");
@@ -224,7 +216,7 @@ pub async fn start() -> Result<(), JsValue> {
 		while let Some(data) = receiver.next().await {
 			console_log!("from userspace: {:?}", data);
 			// console_log!("clonsing...");
-			// sender.close().await.ok();
+			sender.close().await.ok();
 			// console_log!("clonsing ok");
 		}
 		console_log!("Socket stream is terminated");
