@@ -1,5 +1,5 @@
 [package]
-name = "web_ws"
+name = "web-ws"
 version = "0.1.0"
 authors = ["tet <gmorer@pm.me>"]
 edition = "2018"
