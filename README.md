@@ -20,5 +20,4 @@ pub async fn start() -> Result<(), JsValue> {
 	}
 	Ok(())
 }
-
 ```

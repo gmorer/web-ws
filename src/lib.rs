@@ -1,4 +1,30 @@
 #![no_std]
+
+//! # web-ws
+//! 
+//! WASM library to use JavaScript's WebSockets easly.
+//! 
+//! ## Usage
+//! 
+//! ```rust
+//! use web_ws::WSStream;
+//! 
+//! #[wasm_bindgen(start)]
+//! pub async fn start() -> Result<(), JsValue> {
+//! 	let ws = WSStream::connect(&"ws://localhost:8080/foo").await;
+//! 	if let Ok(ws) = ws {
+//! 		let (mut sender, mut receiver) = ws.split();
+//! 		sender.send(b"test123").await.ok();
+//! 		while let Some(data) = receiver.next().await {
+//! 			console_log!("{:?}", data);
+//! 			// if ... { sender.close(); }
+//! 		}
+//! 	}
+//! 	Ok(())
+//! }
+//! ```
+
+
 use core::cell::RefCell;
 use core::pin::Pin;
 use bytes::{ Bytes, BytesMut };
@@ -24,7 +50,7 @@ macro_rules! console_log {
     ($($t:tt)*) => (log(&format_args!($($t)*).to_string()))
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 enum State {
 	Connected,
     Closed,
@@ -59,6 +85,11 @@ impl Drop for WSStream {
 }
 
 impl WSStream {
+
+	/// Create a new opened WebSocket connection from an address.
+	/// 
+	/// Return an error if the connection cannot be opened.
+
     pub async fn connect(url: &str) -> Result<WSStream, Error> {
         let ws = WebSocket::new(url).map_err(|_| Error::Any)?;
         ws.set_binary_type(web_sys::BinaryType::Arraybuffer);
@@ -95,20 +126,22 @@ impl WSStream {
         }) as Box<dyn FnMut(JsValue)>);
         ws.set_onclose(Some(on_close_cb.as_ref().unchecked_ref()));
 
+        // On Connect Error
         let (send_error_connect, recv_error_connect) = oneshot::channel::<ErrorEvent>();
 		let mut send_error_connect = Some(send_error_connect);
-        // On Connect Error
         let on_connect_error_cb = Closure::wrap(Box::new(move |e: ErrorEvent| {
 			send_error_connect.take().map(|sender| sender.send(e).ok());
         }) as Box<dyn FnMut(ErrorEvent)>);
-        ws.set_onerror(Some(on_connect_error_cb.as_ref().unchecked_ref()));
+		ws.set_onerror(Some(on_connect_error_cb.as_ref().unchecked_ref()));
+		
 		// On Connect OK
 		let (send_ok_connect, recv_ok_connect) = oneshot::channel::<bool>();
 		let mut send_ok_connect = Some(send_ok_connect);
         let on_open_cb = Closure::wrap(Box::new(move |_| {
 			send_ok_connect.take().map(|sender| sender.send(true).ok());
         }) as Box<dyn FnMut(JsValue)>);
-        ws.set_onopen(Some(on_open_cb.as_ref().unchecked_ref()));
+		ws.set_onopen(Some(on_open_cb.as_ref().unchecked_ref()));
+
 		// Wait for the connection ok or err
 		match future::select(recv_ok_connect, recv_error_connect).await {
 			Either::Left((_, _)) => { /* Received something on recv_ok_connect */ },
