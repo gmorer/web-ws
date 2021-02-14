@@ -61,7 +61,7 @@ enum State {
 pub enum Error {
 	Any,
 	CloseSocket,
-	Js(ErrorEvent)
+	Js(JsValue)
 }
 
 
@@ -91,7 +91,7 @@ impl WSStream {
 	/// Return an error if the connection cannot be opened.
 
     pub async fn connect(url: &str) -> Result<WSStream, Error> {
-        let ws = WebSocket::new(url).map_err(|_| Error::Any)?;
+        let ws = WebSocket::new(url).map_err(|e| Error::Js(e))?;
         ws.set_binary_type(web_sys::BinaryType::Arraybuffer);
 
 		// Value shared with the callbacks and the struct
@@ -147,7 +147,7 @@ impl WSStream {
 			Either::Left((_, _)) => { /* Received something on recv_ok_connect */ },
 			Either::Right((e, _)) => {
 				ws.set_onclose(None);
-				return Err(Error::Js(e.unwrap())); // Err if sender droped, not the case here
+				return Err(Error::Js(e.unwrap().error())); // Err if sender droped, not the case here
 			}
 		}
         ws.set_onopen(None);
