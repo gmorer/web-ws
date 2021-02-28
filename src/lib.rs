@@ -213,7 +213,7 @@ impl futures::sink::Sink<&[u8]> for WSStream {
 }
 
 impl futures::stream::Stream for WSStream {
-	type Item = Bytes;
+	type Item = Result<Bytes, Error>;
 	fn poll_next(
         self: Pin<&mut Self>, 
         cx: &mut Context<'_>
@@ -227,7 +227,7 @@ impl futures::stream::Stream for WSStream {
 			Poll::Pending
 		} else {
 			let ret = core::mem::replace(&mut *internal_buf, BytesMut::new());
-			Poll::Ready(Some(ret.freeze()))			
+			Poll::Ready(Some(Ok(ret.freeze())))
 		}
 	}
 }
