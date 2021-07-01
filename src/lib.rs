@@ -39,6 +39,7 @@ extern crate alloc;
 use alloc::rc::Rc;
 use alloc::string::{ ToString, String };
 use alloc::prelude::v1::Box;
+use alloc::vec::Vec;
 
 #[wasm_bindgen]
 extern "C" {
@@ -169,9 +170,13 @@ impl WSStream {
 			state
         })
 	}
+
+    pub fn send_sync(&self, data: &[u8]) -> Result<(), Error> {
+		self.ws.send_with_u8_array(data).map_err(Error::Js)
+    }
 }
 
-impl futures::sink::Sink<&[u8]> for WSStream {
+impl futures::sink::Sink<Vec<u8>> for WSStream {
 	type Error = Error;
     fn poll_ready(
         self: Pin<&mut Self>, 
@@ -183,11 +188,11 @@ impl futures::sink::Sink<&[u8]> for WSStream {
 			Poll::Ready(Ok(()))
 		}
 	}
-    fn start_send(self: Pin<&mut Self>, item: &[u8]) -> Result<(), Self::Error> {
+    fn start_send(self: Pin<&mut Self>, item: Vec<u8>) -> Result<(), Self::Error> {
 		if *(self.state.borrow()) == State::Closed {
 			Err(Error::CloseSocket)
 		} else {
-			self.ws.send_with_u8_array(item).map_err(|_| Error::Any)
+			self.ws.send_with_u8_array(&item).map_err(|_| Error::Any)
 		}
 	}
     fn poll_flush(
@@ -213,7 +218,7 @@ impl futures::sink::Sink<&[u8]> for WSStream {
 }
 
 impl futures::stream::Stream for WSStream {
-	type Item = Result<Bytes, Error>;
+	type Item = Result<alloc::vec::Vec<u8>, Error>;
 	fn poll_next(
         self: Pin<&mut Self>, 
         cx: &mut Context<'_>
@@ -227,7 +232,7 @@ impl futures::stream::Stream for WSStream {
 			Poll::Pending
 		} else {
 			let ret = core::mem::replace(&mut *internal_buf, BytesMut::new());
-			Poll::Ready(Some(Ok(ret.freeze())))
+			Poll::Ready(Some(Ok(ret.to_vec())))
 		}
 	}
 }
