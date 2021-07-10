@@ -27,6 +27,8 @@
 use bytes::{Bytes, BytesMut};
 use core::cell::RefCell;
 use core::pin::Pin;
+use futures::channel::mpsc::{Sender as BoundedSender, UnboundedSender};
+
 use futures::channel::oneshot;
 use futures::future::{self, Either};
 use futures::task::{Context, Poll, Waker};
@@ -38,7 +40,6 @@ extern crate alloc;
 use alloc::prelude::v1::Box;
 use alloc::rc::Rc;
 use alloc::string::{String, ToString};
-use alloc::vec::Vec;
 
 #[wasm_bindgen]
 extern "C" {
@@ -62,6 +63,54 @@ pub enum Error {
     Any,
     CloseSocket,
     Js(JsValue),
+    NotCompatible,
+}
+
+#[derive(Debug, Clone)]
+pub enum ChannelSender {
+    Unbounded(UnboundedSender<Bytes>),
+    Bounded(BoundedSender<Bytes>),
+}
+
+#[derive(Debug, Clone)]
+pub enum Sender {
+    Buffer(Rc<RefCell<BytesMut>>),
+    Sender(ChannelSender),
+}
+
+impl Sender {
+    pub fn send(&mut self, data: Bytes) -> Result<(), String> {
+        match self {
+            Sender::Buffer(buffer) => {
+                buffer.borrow_mut().extend_from_slice(&data);
+                Ok(())
+            }
+            Sender::Sender(ChannelSender::Bounded(bounded)) => {
+                bounded.try_send(data).map_err(|e| alloc::format!("{}", e))
+            }
+            Sender::Sender(ChannelSender::Unbounded(unbounded)) => unbounded
+                .unbounded_send(data)
+                .map_err(|e| alloc::format!("{}", e)),
+        }
+    }
+}
+
+impl From<UnboundedSender<Bytes>> for Sender {
+    fn from(sender: UnboundedSender<Bytes>) -> Self {
+        Sender::Sender(ChannelSender::Unbounded(sender))
+    }
+}
+
+impl From<BoundedSender<Bytes>> for Sender {
+    fn from(sender: BoundedSender<Bytes>) -> Self {
+        Sender::Sender(ChannelSender::Bounded(sender))
+    }
+}
+
+impl From<()> for Sender {
+    fn from(_sender: ()) -> Self {
+        Sender::Buffer(Rc::new(RefCell::new(BytesMut::new())))
+    }
 }
 
 #[derive(Debug)]
@@ -72,7 +121,7 @@ pub struct WSStream {
     on_close_cb: Closure<dyn FnMut(JsValue)>,
     state: Rc<RefCell<State>>,
     read_waker: Rc<RefCell<Option<Waker>>>,
-    buffer: Rc<RefCell<BytesMut>>,
+    sender: Sender,
 }
 
 impl Drop for WSStream {
@@ -92,17 +141,21 @@ impl WSStream {
     ///
     /// Return an error if the connection cannot be opened.
 
-    pub async fn connect(url: &str) -> Result<WSStream, Error> {
+    pub async fn connect(url: &str, receiver: Option<Sender>) -> Result<WSStream, Error> {
         let ws = WebSocket::new(url).map_err(|e| Error::Js(e))?;
         ws.set_binary_type(web_sys::BinaryType::Arraybuffer);
 
         // Value shared with the callbacks and the struct
         let state = Rc::new(RefCell::new(State::Connected));
-        let buffer = Rc::new(RefCell::new(BytesMut::new()));
+        let sender = if let Some(receiver) = receiver {
+            receiver
+        } else {
+            Sender::from(())
+        };
         let waker: Rc<RefCell<Option<Waker>>> = Rc::new(RefCell::new(None));
 
         // On Message
-        let buffer_cl = buffer.clone();
+        let mut sender_cl = sender.clone();
         let waker_cl = waker.clone();
         let on_message_cb = Closure::wrap(Box::new(move |e: MessageEvent| {
             let data = if let Ok(abuf) = e.data().dyn_into::<js_sys::ArrayBuffer>() {
@@ -114,7 +167,7 @@ impl WSStream {
                 console_log!("Unknow incomming data");
                 return;
             };
-            buffer_cl.borrow_mut().extend_from_slice(&data);
+            sender_cl.send(data).map_err(|e| console_log!("{}", e)).ok();
             waker_cl.borrow().as_ref().map(|waker| waker.wake_by_ref());
         }) as Box<dyn FnMut(MessageEvent)>);
         ws.set_onmessage(Some(on_message_cb.as_ref().unchecked_ref()));
@@ -167,7 +220,7 @@ impl WSStream {
             on_message_cb,
             on_close_cb,
             read_waker: waker,
-            buffer,
+            sender,
             state,
         })
     }
@@ -177,7 +230,7 @@ impl WSStream {
     }
 }
 
-impl futures::sink::Sink<Vec<u8>> for WSStream {
+impl futures::sink::Sink<Bytes> for WSStream {
     type Error = Error;
     fn poll_ready(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         if *(self.state.borrow()) == State::Closed {
@@ -186,7 +239,7 @@ impl futures::sink::Sink<Vec<u8>> for WSStream {
             Poll::Ready(Ok(()))
         }
     }
-    fn start_send(self: Pin<&mut Self>, item: Vec<u8>) -> Result<(), Self::Error> {
+    fn start_send(self: Pin<&mut Self>, item: Bytes) -> Result<(), Self::Error> {
         if *(self.state.borrow()) == State::Closed {
             Err(Error::CloseSocket)
         } else {
@@ -214,18 +267,23 @@ impl futures::sink::Sink<Vec<u8>> for WSStream {
 }
 
 impl futures::stream::Stream for WSStream {
-    type Item = Result<alloc::vec::Vec<u8>, Error>;
+    type Item = Result<Bytes, Error>;
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let mut internal_buf = self.buffer.borrow_mut();
-        let in_len = internal_buf.len();
-        if *(self.state.borrow()) == State::Closed {
-            Poll::Ready(None)
-        } else if in_len == 0 {
-            self.read_waker.replace(Some(cx.waker().clone()));
-            Poll::Pending
-        } else {
-            let ret = core::mem::replace(&mut *internal_buf, BytesMut::new());
-            Poll::Ready(Some(Ok(ret.to_vec())))
+        match &self.sender {
+            Sender::Buffer(buffer) => {
+                let mut internal_buf = buffer.borrow_mut();
+                let in_len = internal_buf.len();
+                if *(self.state.borrow()) == State::Closed {
+                    Poll::Ready(None)
+                } else if in_len == 0 {
+                    self.read_waker.replace(Some(cx.waker().clone()));
+                    Poll::Pending
+                } else {
+                    let ret = core::mem::replace(&mut *internal_buf, BytesMut::new());
+                    Poll::Ready(Some(Ok(ret.freeze())))
+                }
+            }
+            _ => Poll::Ready(Some(Err(Error::NotCompatible))),
         }
     }
 }
